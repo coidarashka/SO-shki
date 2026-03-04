@@ -1,33 +1,35 @@
 name: Test AiEngine .so (GoogleTest)
 
 on:
-  workflow_dispatch: # Позволяет запускать вручную по кнопке "Run workflow"
+  workflow_dispatch: # Запуск по кнопке
 
 env:
   NDK_VERSION: r26b
 
 jobs:
   test:
-    runs-on: macos-latest # Используем самый актуальный и стабильный macOS runner
+    runs-on: ubuntu-latest # Возвращаемся на Linux
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Install dependencies (macOS)
-        run: brew install cmake ninja
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y cmake ninja-build unzip wget
 
       - name: Setup Android NDK
         run: |
-          wget -q https://dl.google.com/android/repository/android-ndk-${NDK_VERSION}-darwin.zip
-          unzip -q android-ndk-${NDK_VERSION}-darwin.zip
+          # Качаем NDK под Linux
+          wget -q https://dl.google.com/android/repository/android-ndk-${NDK_VERSION}-linux.zip
+          unzip -q android-ndk-${NDK_VERSION}-linux.zip
           echo "NDK_HOME=$PWD/android-ndk-${NDK_VERSION}" >> $GITHUB_ENV
 
-      # Автоматически скачивает артефакт из ПОСЛЕДНЕЙ успешной сборки build-release.yml
       - name: Download Artifact
         uses: dawidd6/action-download-artifact@v3
         with:
-          workflow: build-release.yml # Убедитесь, что имя файла совпадает с вашим workflow сборки
+          workflow: build-release.yml # Имя вашего YAML файла сборки
           workflow_conclusion: success
           name: libAiEngine-arm64-v8a
           path: downloaded_artifact
@@ -56,6 +58,8 @@ jobs:
           target: default
           arch: arm64-v8a
           profile: Nexus 6
+          # Максимально отключаем лишнюю графику, чтобы QEMU не тормозил
+          emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none
           disable-animations: true
           script: |
             echo "Pushing test executable and library to device..."
