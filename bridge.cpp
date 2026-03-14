@@ -59,7 +59,7 @@ extern "C" {
             return -2;
         }
         if (!p || strlen(p) == 0 || strcmp(p, "none") == 0) {
-            LOGD("Mandre: [load_mmproj] Vision пропущен (нет пути).");
+            LOGD("Mandre:[load_mmproj] Vision пропущен (нет пути).");
             return 0;
         }
 
@@ -147,15 +147,14 @@ extern "C" {
         g_cancel_flag = false;
         llama_sampler_reset(g_sampler);
         
-        // НОВАЯ ОЧИСТКА ПАМЯТИ
         LOGD("Mandre: [infer] Очистка KV памяти llama_memory_clear...");
         llama_memory_clear(llama_get_memory(g_ctx), true); 
         int n_past = 0;
 
         std::string prompt_str = pr;
         mtmd_bitmap* bmp = nullptr;
+        mtmd_input_chunks* chunks = nullptr;
 
-        // --- УСИЛЕННЫЙ ДЕБАГ VISION ---
         if (img && strlen(img) > 0 && strcmp(img, "none") != 0 && g_mtmd_ctx) {
             LOGD("Mandre: [Vision] Обнаружена картинка: %s", img);
             int w, h, c;
@@ -166,52 +165,60 @@ extern "C" {
                 LOGD("Mandre: [Vision] Пиксели прочитаны! Разрешение: %dx%d, Каналов: %d", w, h, c);
                 bmp = mtmd_bitmap_init(w, h, data);
                 stbi_image_free(data);
-                LOGD("Mandre: [Vision] mtmd_bitmap успешно создан в памяти.");
 
-                // MTMD ожидает маркер <__media__> в промпте для замены на эмбеддинг картинки.
                 if (prompt_str.find("<__media__>") == std::string::npos) {
                     LOGD("Mandre: [Vision] Маркер <__media__> не найден. Вставляем картинку в начало промпта.");
                     prompt_str = "<__media__>\n" + prompt_str;
                 }
             } else {
-                LOGE("Mandre:[Vision] КРИТИЧЕСКАЯ ОШИБКА STB! Невозможно прочитать файл: %s", img);
-                LOGE("Mandre: [Vision] Файл может быть битым, или путь передан не в формате файловой системы.");
+                LOGE("Mandre:[Vision] КРИТИЧЕСКАЯ ОШИБКА STB! Невозможно прочитать файл.");
             }
         }
 
         llama_batch batch_tok = llama_batch_init(g_conf.n_batch, 0, 1);
 
-        // Универсальный обработчик текстовых токенов
-        auto process_text_tokens = [&](const llama_token* toks, size_t n_t) {
+        // Функция принудительного сброса текстового батча (ВАЖНО ДЛЯ ИЗБЕЖАНИЯ КРАШЕЙ)
+        auto flush_text = [&](bool require_logits) -> int {
+            if (batch_tok.n_tokens > 0) {
+                if (require_logits) batch_tok.logits[batch_tok.n_tokens - 1] = true;
+                
+                LOGD("Mandre: [infer] Декодирование текста (отправка %d токенов)...", batch_tok.n_tokens);
+                if (llama_decode(g_ctx, batch_tok) != 0) {
+                    LOGE("Mandre: [infer] ОШИБКА llama_decode текста!");
+                    return -1;
+                }
+                batch_tok.n_tokens = 0;
+            }
+            return 0;
+        };
+
+        auto process_text_tokens = [&](const llama_token* toks, size_t n_t) -> int {
             for (size_t k = 0; k < n_t; k++) {
                 batch_tok.token[batch_tok.n_tokens] = toks[k];
                 batch_tok.pos[batch_tok.n_tokens] = n_past++;
                 batch_tok.n_seq_id[batch_tok.n_tokens] = 1;
                 batch_tok.seq_id[batch_tok.n_tokens][0] = 0;
-                batch_tok.logits[batch_tok.n_tokens] = false; // Потом исправим для последнего
+                batch_tok.logits[batch_tok.n_tokens] = false;
                 batch_tok.n_tokens++;
                 
                 if (batch_tok.n_tokens == g_conf.n_batch) {
-                    LOGD("Mandre: [infer] Отправка куска текста (%d токенов) в LLM...", batch_tok.n_tokens);
-                    if (llama_decode(g_ctx, batch_tok) != 0) LOGE("Mandre: [infer] ОШИБКА llama_decode текста!");
-                    batch_tok.n_tokens = 0; // Правильная очистка в новых версиях
+                    if (flush_text(false) != 0) return -1;
                 }
             }
+            return 0;
         };
 
-        if (g_mtmd_ctx) {
+        if (g_mtmd_ctx && bmp != nullptr) {
             LOGD("Mandre: [Vision] Запуск mtmd_tokenize...");
             mtmd_input_text input_txt;
             input_txt.text = prompt_str.c_str();
             input_txt.add_special = true;
             input_txt.parse_special = true;
 
-            mtmd_input_chunks* chunks = mtmd_input_chunks_init();
+            chunks = mtmd_input_chunks_init();
             const mtmd_bitmap* bitmaps_arr[] = { bmp };
-            int num_bitmaps = (bmp != nullptr) ? 1 : 0;
             
-            int tok_res = mtmd_tokenize(g_mtmd_ctx, chunks, &input_txt, bitmaps_arr, num_bitmaps);
-            if (tok_res == 0) {
+            if (mtmd_tokenize(g_mtmd_ctx, chunks, &input_txt, bitmaps_arr, 1) == 0) {
                 size_t n_chunks = mtmd_input_chunks_size(chunks);
                 LOGD("Mandre: [Vision] mtmd_tokenize успешен! Промпт разбит на %zu блоков(chunks).", n_chunks);
                 
@@ -222,17 +229,20 @@ extern "C" {
                     if (type == MTMD_INPUT_CHUNK_TYPE_TEXT) {
                         size_t n_t = 0;
                         const llama_token* toks = mtmd_input_chunk_get_tokens_text(chunk, &n_t);
-                        LOGD("Mandre: [Vision] Чанк %zu: ТЕКСТ (%zu токенов)", i, n_t);
-                        process_text_tokens(toks, n_t);
+                        LOGD("Mandre:[Vision] Чанк %zu: ТЕКСТ (%zu токенов)", i, n_t);
+                        if (process_text_tokens(toks, n_t) != 0) goto error_cleanup;
                         
                     } else if (type == MTMD_INPUT_CHUNK_TYPE_IMAGE) {
-                        LOGD("Mandre: [Vision] Чанк %zu: ИЗОБРАЖЕНИЕ. Начат CLIP Encoding (mtmd_encode_chunk)...", i);
+                        // КРИТИЧЕСКИЙ МОМЕНТ: Перед картинкой очищаем всю предыдущую текстовую очередь
+                        LOGD("Mandre: [Vision] Чанк %zu: ИЗОБРАЖЕНИЕ. Очистка буфера текста перед картинкой...", i);
+                        if (flush_text(false) != 0) goto error_cleanup;
+
+                        LOGD("Mandre: [Vision] Начат CLIP Encoding (mtmd_encode_chunk)...");
                         if (mtmd_encode_chunk(g_mtmd_ctx, chunk) == 0) {
                             float* embd = mtmd_get_output_embd(g_mtmd_ctx);
                             size_t n_img_toks = mtmd_input_chunk_get_n_tokens(chunk);
                             LOGD("Mandre: [Vision] Изображение закодировано. Занято токенов: %zu", n_img_toks);
                             
-                            // Создаем отдельный батч специально для Эмбеддингов (указываем размер эмбеддинга)
                             int embd_dim = llama_model_n_embd_inp(g_model);
                             llama_batch batch_emb = llama_batch_init(g_conf.n_batch, embd_dim, 1);
                             
@@ -243,50 +253,49 @@ extern "C" {
                                 batch_emb.logits[batch_emb.n_tokens] = false;
                                 
                                 memcpy(batch_emb.embd + batch_emb.n_tokens * embd_dim,
-                                       embd + k * embd_dim,
-                                       embd_dim * sizeof(float));
+                                       embd + k * embd_dim, embd_dim * sizeof(float));
                                        
                                 batch_emb.n_tokens++;
                                 if (batch_emb.n_tokens == g_conf.n_batch) {
                                     LOGD("Mandre: [Vision] Отправка части картинки (батч %d) в LLM...", batch_emb.n_tokens);
-                                    if(llama_decode(g_ctx, batch_emb) != 0) LOGE("Mandre: [Vision] ОШИБКА llama_decode картинки!");
+                                    if(llama_decode(g_ctx, batch_emb) != 0) {
+                                        LOGE("Mandre: [Vision] ОШИБКА llama_decode картинки!");
+                                        llama_batch_free(batch_emb);
+                                        goto error_cleanup;
+                                    }
                                     batch_emb.n_tokens = 0;
                                 }
                             }
                             if (batch_emb.n_tokens > 0) {
                                 LOGD("Mandre: [Vision] Отправка остатка картинки (%d токенов) в LLM...", batch_emb.n_tokens);
-                                if(llama_decode(g_ctx, batch_emb) != 0) LOGE("Mandre: [Vision] ОШИБКА llama_decode картинки!");
+                                if(llama_decode(g_ctx, batch_emb) != 0) {
+                                    LOGE("Mandre: [Vision] ОШИБКА llama_decode картинки!");
+                                    llama_batch_free(batch_emb);
+                                    goto error_cleanup;
+                                }
                             }
                             llama_batch_free(batch_emb);
                         } else {
                             LOGE("Mandre: [Vision] КРИТИЧЕСКАЯ ОШИБКА: mtmd_encode_chunk провалился!");
+                            goto error_cleanup;
                         }
                     }
                 }
             } else {
-                LOGE("Mandre: [Vision] ОШИБКА mtmd_tokenize. Код: %d", tok_res);
+                LOGE("Mandre: [Vision] ОШИБКА mtmd_tokenize.");
+                goto error_cleanup;
             }
-            
-            mtmd_input_chunks_free(chunks);
-            if (bmp) mtmd_bitmap_free(bmp);
-            
         } else {
-            // Обычный текстовый инференс без Vision
-            LOGD("Mandre: [infer] Vision не загружен. Обычная токенизация...");
+            // Обычный текстовый инференс
+            LOGD("Mandre: [infer] Обычная токенизация текста...");
             std::vector<llama_token> tk(prompt_str.size() + 16);
             int n = llama_tokenize(g_vocab, prompt_str.c_str(), prompt_str.size(), tk.data(), tk.size(), true, true);
             tk.resize(n);
-            LOGD("Mandre:[infer] Промпт разбит на %d токенов", n);
-            process_text_tokens(tk.data(), n);
+            if (process_text_tokens(tk.data(), n) != 0) goto error_cleanup;
         }
         
-        // Помечаем самый последний токен как требующий logits
-        if (batch_tok.n_tokens > 0) {
-            batch_tok.logits[batch_tok.n_tokens - 1] = true;
-            LOGD("Mandre: [infer] Декодирование финального текстового батча (%d токенов)...", batch_tok.n_tokens);
-            if (llama_decode(g_ctx, batch_tok) != 0) LOGE("Mandre: [infer] ОШИБКА llama_decode!");
-            batch_tok.n_tokens = 0;
-        }
+        // Финальный сброс хвоста промпта (просим сгенерировать Logits для самого последнего токена)
+        if (flush_text(true) != 0) goto error_cleanup;
 
         LOGD("Mandre: [infer] Контекст заполнен (n_past = %d). Старт генерации!", n_past);
         int think_tokens = 0;
@@ -296,7 +305,10 @@ extern "C" {
             if (g_cancel_flag) break;
 
             llama_token id = llama_sampler_sample(g_sampler, g_ctx, -1);
-            if (llama_vocab_is_eog(g_vocab, id)) break;
+            if (llama_vocab_is_eog(g_vocab, id)) {
+                LOGD("Mandre: [infer] Получен EOG токен. Завершение.");
+                break;
+            }
 
             char b[256];
             int n_p = llama_token_to_piece(g_vocab, id, b, sizeof(b), 0, true);
@@ -308,7 +320,7 @@ extern "C" {
                 if (in_think_tag) {
                     think_tokens++;
                     if (think_tokens > g_conf.max_think_tokens) {
-                        cb("\n[Think Limit Exceeded]\n");
+                        cb("\n[Лимит размышлений превышен]\n");
                         in_think_tag = false;
                     }
                 }
@@ -334,7 +346,17 @@ extern "C" {
         }
         
         LOGD("Mandre: [infer] Инференс завершен!");
+        
+        if (chunks) mtmd_input_chunks_free(chunks);
+        if (bmp) mtmd_bitmap_free(bmp);
         llama_batch_free(batch_tok);
         return 0;
+
+error_cleanup:
+        LOGE("Mandre: [infer] Аварийное завершение из-за ошибки в процессе!");
+        if (chunks) mtmd_input_chunks_free(chunks);
+        if (bmp) mtmd_bitmap_free(bmp);
+        llama_batch_free(batch_tok);
+        return -1;
     }
 }
