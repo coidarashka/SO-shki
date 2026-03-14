@@ -10,7 +10,7 @@
 #include <ctime>
 #include <csignal>
 
-// ВНИМАНИЕ: Убрали #define STB_IMAGE_IMPLEMENTATION, так как реализация уже есть в mtmd-helper.cpp!
+// Реализация уже есть в mtmd-helper.cpp
 #include "stb/stb_image.h"
 
 using json = nlohmann::json;
@@ -48,7 +48,7 @@ extern "C" {
         if (g_model)    { LOGD("Mandre: [free] Model"); llama_model_free(g_model); g_model = nullptr; }
         LOGD("Mandre:[free_engine] Освобождение бекенда...");
         llama_backend_free();
-        LOGD("Mandre: [free_engine] Готово");
+        LOGD("Mandre:[free_engine] Готово");
     }
 
     // 2. Загрузка Vision (MMPROJ / CLIP)
@@ -72,7 +72,7 @@ extern "C" {
         LOGD("Mandre: [load_mmproj] Чтение MTMD CLIP файла...");
         g_mtmd_ctx = mtmd_init_from_file(p, g_model, params);
         if (g_mtmd_ctx) {
-            LOGD("Mandre: [load_mmproj] Vision успешно загружен!");
+            LOGD("Mandre:[load_mmproj] Vision успешно загружен!");
             return 0;
         } else {
             LOGE("Mandre:[load_mmproj] КРИТИЧЕСКАЯ ОШИБКА: mtmd_init_from_file вернул null.");
@@ -141,7 +141,7 @@ extern "C" {
     // 5. Инференс (MTMD Vision + Текст)
     typedef void (*cb_t)(const char*);
     int infer(const char* pr, const char* img, cb_t cb) {
-        LOGD("Mandre: [infer] === НОВЫЙ ЗАПРОС ===");
+        LOGD("Mandre:[infer] === НОВЫЙ ЗАПРОС ===");
         if (!g_ctx || !g_sampler) { LOGE("Mandre: Контекст не инициализирован!"); return -1; }
         
         g_cancel_flag = false;
@@ -149,17 +149,21 @@ extern "C" {
         
         LOGD("Mandre: [infer] Очистка KV памяти llama_memory_clear...");
         llama_memory_clear(llama_get_memory(g_ctx), true); 
+        
+        // ВСЕ ПЕРЕМЕННЫЕ ДО GOTO ДОЛЖНЫ БЫТЬ ЗДЕСЬ!
         int n_past = 0;
+        int think_tokens = 0;
+        bool in_think_tag = false;
 
         std::string prompt_str = pr;
         mtmd_bitmap* bmp = nullptr;
         mtmd_input_chunks* chunks = nullptr;
 
         if (img && strlen(img) > 0 && strcmp(img, "none") != 0 && g_mtmd_ctx) {
-            LOGD("Mandre: [Vision] Обнаружена картинка: %s", img);
+            LOGD("Mandre:[Vision] Обнаружена картинка: %s", img);
             int w, h, c;
             LOGD("Mandre:[Vision] Запуск STB_IMAGE (stbi_load)...");
-            unsigned char* data = stbi_load(img, &w, &h, &c, 3); // Принудительно 3 канала (RGB)
+            unsigned char* data = stbi_load(img, &w, &h, &c, 3); 
             
             if (data) {
                 LOGD("Mandre: [Vision] Пиксели прочитаны! Разрешение: %dx%d, Каналов: %d", w, h, c);
@@ -177,7 +181,6 @@ extern "C" {
 
         llama_batch batch_tok = llama_batch_init(g_conf.n_batch, 0, 1);
 
-        // Функция принудительного сброса текстового батча (ВАЖНО ДЛЯ ИЗБЕЖАНИЯ КРАШЕЙ)
         auto flush_text = [&](bool require_logits) -> int {
             if (batch_tok.n_tokens > 0) {
                 if (require_logits) batch_tok.logits[batch_tok.n_tokens - 1] = true;
@@ -233,7 +236,6 @@ extern "C" {
                         if (process_text_tokens(toks, n_t) != 0) goto error_cleanup;
                         
                     } else if (type == MTMD_INPUT_CHUNK_TYPE_IMAGE) {
-                        // КРИТИЧЕСКИЙ МОМЕНТ: Перед картинкой очищаем всю предыдущую текстовую очередь
                         LOGD("Mandre: [Vision] Чанк %zu: ИЗОБРАЖЕНИЕ. Очистка буфера текста перед картинкой...", i);
                         if (flush_text(false) != 0) goto error_cleanup;
 
@@ -282,11 +284,10 @@ extern "C" {
                     }
                 }
             } else {
-                LOGE("Mandre: [Vision] ОШИБКА mtmd_tokenize.");
+                LOGE("Mandre:[Vision] ОШИБКА mtmd_tokenize.");
                 goto error_cleanup;
             }
         } else {
-            // Обычный текстовый инференс
             LOGD("Mandre: [infer] Обычная токенизация текста...");
             std::vector<llama_token> tk(prompt_str.size() + 16);
             int n = llama_tokenize(g_vocab, prompt_str.c_str(), prompt_str.size(), tk.data(), tk.size(), true, true);
@@ -294,12 +295,9 @@ extern "C" {
             if (process_text_tokens(tk.data(), n) != 0) goto error_cleanup;
         }
         
-        // Финальный сброс хвоста промпта (просим сгенерировать Logits для самого последнего токена)
         if (flush_text(true) != 0) goto error_cleanup;
 
         LOGD("Mandre: [infer] Контекст заполнен (n_past = %d). Старт генерации!", n_past);
-        int think_tokens = 0;
-        bool in_think_tag = false;
 
         for (int i = 0; i < g_conf.max_tokens; i++) {
             if (g_cancel_flag) break;
@@ -330,8 +328,7 @@ extern "C" {
 
             llama_sampler_accept(g_sampler, id);
             
-            // Отправляем сгенерированный токен обратно в контекст
-            batch_tok.n_tokens = 0; // Сброс
+            batch_tok.n_tokens = 0; 
             batch_tok.token[0] = id;
             batch_tok.pos[0] = n_past++;
             batch_tok.n_seq_id[0] = 1;
